@@ -7,6 +7,11 @@ export const corsHeaders: Record<string, string> = {
   "Access-Control-Max-Age": "3600",
 };
 
+interface AESKeyInfo {
+  method: string;
+  uri: string;
+}
+
 export async function RequestHandler({ response }: { response: HonoRequest }) {
   try {
     const { url, ref } = response.query();
@@ -61,7 +66,6 @@ export async function RequestHandler({ response }: { response: HonoRequest }) {
       type.includes("audio/x-mpegurl") ||
       (type.includes("text/html") &&
         (url.endsWith(".m3u8") || url.endsWith(".ts")))
-      // including mp2t shouldn't be necessary but then there are some loose cases which report mp2t for m3u8 streams as well
     ) {
       responseBody = (await fetchedResponse.text()) as string;
       if (!responseBody.startsWith("#EXTM3U")) {
@@ -78,8 +82,51 @@ export async function RequestHandler({ response }: { response: HonoRequest }) {
       const urlRegex = /^(?:(?:(?:https?|ftp):)?\/\/)[^\s/$.?#].[^\s]*$/i;
       const m3u8FileChunks = responseBody.split("\n");
       const m3u8AdjustedChunks = [];
+      let currentKeyInfo: AESKeyInfo | null = null;
 
       for (const line of m3u8FileChunks) {
+        if (line.startsWith("#EXT-X-KEY:")) {
+          // Parse encryption key information
+          const keyParams = line.substring("#EXT-X-KEY:".length).split(",");
+          const keyInfo: AESKeyInfo = {
+            method: "",
+            uri: "",
+          };
+
+          for (const param of keyParams) {
+            const [key, value] = param.split("=");
+            if (key === "METHOD") {
+              keyInfo.method = value;
+            } else if (key === "URI") {
+              // Remove quotes from URI
+              keyInfo.uri = value.replace(/"/g, "");
+            }
+          }
+
+          if (keyInfo.method === "AES-128" && keyInfo.uri) {
+            currentKeyInfo = keyInfo;
+            // Proxy the key URL
+            if (keyInfo.uri.match(urlRegex)) {
+              m3u8AdjustedChunks.push(
+                `#EXT-X-KEY:METHOD=AES-128,URI="/fetch?url=${encodeURIComponent(
+                  keyInfo.uri
+                )}${refString}"`
+              );
+            } else {
+              const newKeyUrl = url.replace(
+                regex,
+                keyInfo.uri.startsWith("/") ? keyInfo.uri : `/${keyInfo.uri}`
+              );
+              m3u8AdjustedChunks.push(
+                `#EXT-X-KEY:METHOD=AES-128,URI="/fetch?url=${encodeURIComponent(
+                  newKeyUrl
+                )}${refString}"`
+              );
+            }
+            continue;
+          }
+        }
+
         if (line.startsWith("#") || !line.trim()) {
           m3u8AdjustedChunks.push(line);
           continue;
@@ -92,8 +139,9 @@ export async function RequestHandler({ response }: { response: HonoRequest }) {
 
         if (formattedLine.match(urlRegex)) {
           console.log("TS or M3U8 files with URLs found, adding proxy path");
+          const decodedUrl = decodeURIComponent(formattedLine);
           m3u8AdjustedChunks.push(
-            `/fetch?url=${encodeURIComponent(formattedLine)}${refString}`
+            `/fetch?url=${encodeURIComponent(decodedUrl)}${refString}`
           );
         } else {
           const newUrls = url.replace(
@@ -107,9 +155,12 @@ export async function RequestHandler({ response }: { response: HonoRequest }) {
             `/fetch?url=${encodeURIComponent(newUrls)}${refString}`
           );
         }
-        // Update URL according to your needs
       }
       responseBody = m3u8AdjustedChunks.join("\n");
+    } else if (url.includes(".key")) {
+      // Handle encryption key requests
+      responseBody = await fetchedResponse.arrayBuffer();
+      type = "application/octet-stream";
     } else {
       responseBody = await fetchedResponse.arrayBuffer();
     }
@@ -139,7 +190,7 @@ export async function RequestHandler({ response }: { response: HonoRequest }) {
       {
         status: 500,
         headers: {
-          "Content-Type": "application/json", // Set content type to JSON
+          "Content-Type": "application/json",
         },
       }
     );
